@@ -30,8 +30,83 @@ module.exports=async(req,res)=>{
   if(!process.env.ANTHROPIC_API_KEY)return res.status(503).json({error:'Add ANTHROPIC_API_KEY in Vercel Environment Variables.'});
   const system=`You create realistic seven-day optional Healy wellness routines. Return ONLY valid JSON with shape {"intro":"...","days":[{"day":"Monday","type":"Pink Program|Resonance Scan|Aura Scan|Coaching Scan|Rest / Flex|Reflection","title":"...","group":"...","minutes":"...","why":"...","steps":["..."],"optional":false}],"busyDay":"...","note":"..."}. Exactly Monday-Sunday, 7 entries. Schedule at most daysPerWeek active days; other days rest/reflection. Only use program name+group EXACTLY present in allowedPrograms. If none available, make reflection-only plan, say confirm access. Only suggest scan types explicitly present in modules. Resonance scans only suggest databases explicitly listed in scanDatabases; never invent scan outcomes, scan focus editing, or frequency duration. Resonance focus is held mentally, not edited. Aura/Success Coach focus can be edited. Never invent program durations; use 'Check app duration' for Pink Programs; minutesPerDay is a time budget not an asserted program duration. Keep schedule feasible and flexible. Do not claim Healy scans diagnose, objectively measure, treat, cure or prevent conditions. Program descriptions are unverified thematic references, not proof of effects. Do not promise outcomes. Friendly, grounded, occasionally playful but professional. No markdown fences.`;
   const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':process.env.ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},body:JSON.stringify({model:process.env.ANTHROPIC_MODEL||'claude-sonnet-4-6',max_tokens:5000,temperature:0.4,system,messages:[{role:'user',content:JSON.stringify(payload)}]})});
-  const data=await r.json();if(!r.ok)throw Error(data.error?.message||'AI service unavailable');
-  const txt=(data.content||[]).filter(x=>x.type==='text').map(x=>x.text).join('');let out=JSON.parse(txt.replace(/^```(?:json)?\s*|\s*```$/g,''));
+  
+const data = await r.json();
+
+if (!r.ok) {
+  console.error('Anthropic API error:', data.error?.message);
+  return res.status(502).json({
+    error: 'The planning service is temporarily unavailable. Please try again.'
+  });
+}
+
+// Check whether Claude completed its response.
+if (data.stop_reason === 'max_tokens') {
+  console.error('AI response was truncated:', {
+    stop_reason: data.stop_reason,
+    output_tokens: data.usage?.output_tokens
+  });
+
+  return res.status(502).json({
+    error: 'Your plan was too long to generate. Please try again.'
+  });
+}
+
+if (data.stop_reason !== 'end_turn') {
+  console.error('Unexpected AI stop reason:', data.stop_reason);
+  return res.status(502).json({
+    error: 'Your plan could not be completed. Please try again.'
+  });
+}
+
+const txt = (data.content || [])
+  .filter(x => x.type === 'text')
+  .map(x => x.text)
+  .join('')
+  .trim();
+
+let out;
+
+try {
+  out = JSON.parse(
+    txt.replace(/^```(?:json)?\s*|\s*```$/g, '')
+  );
+} catch (parseError) {
+  console.error('Invalid AI JSON:', {
+    message: parseError.message,
+    length: txt.length,
+    stop_reason: data.stop_reason
+  });
+
+  return res.status(502).json({
+    error: 'We had trouble formatting your plan. Please try again.'
+  });
+}
+
+const expectedDays = [
+  'Monday', 'Tuesday', 'Wednesday', 'Thursday',
+  'Friday', 'Saturday', 'Sunday'
+];
+
+if (
+  !out ||
+  typeof out !== 'object' ||
+  !Array.isArray(out.days) ||
+  out.days.length !== 7 ||
+  !expectedDays.every((day, i) =>
+    out.days[i] &&
+    out.days[i].day === day &&
+    typeof out.days[i].type === 'string' &&
+    typeof out.days[i].title === 'string' &&
+    Array.isArray(out.days[i].steps)
+  )
+) {
+  console.error('AI returned an incomplete weekly plan');
+  return res.status(502).json({
+    error: 'Your weekly plan was incomplete. Please try again.'
+  });
+}
+
   const valid=new Set(catalogue.map(p=>norm(p.group)+'|'+norm(p.name)));
   out.days=(out.days||[]).slice(0,7).map(d=>{const copy={...d};if(d.type==='Pink Program'&&!valid.has(norm(d.group)+'|'+norm(d.title)))return {day:d.day,type:'Rest / Flex',title:'Choose an available program',group:'',minutes:'Optional',why:'A recommended program could not be verified against your selected access.',steps:['Check your available programs and try again.'],optional:true};if(d.type==='Resonance Scan'&&!modules.includes('Resonance Analysis'))return {day:d.day,type:'Rest / Flex',title:'Reflection day',minutes:'Optional',why:'Resonance access not confirmed.',steps:[],optional:true};if(d.type==='Aura Scan'&&!modules.includes('Aura Analysis')||d.type==='Coaching Scan'&&!modules.includes('Success Coach'))return {day:d.day,type:'Rest / Flex',title:'Reflection day',minutes:'Optional',why:'Scan access not confirmed.',steps:[],optional:true};return copy;});
   return res.status(200).json(out);
